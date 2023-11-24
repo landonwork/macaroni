@@ -1,15 +1,15 @@
-use std::io;
+use std::{io, fs, path::{Path, PathBuf}};
 use tempfile::TempDir;
 
 use iced::widget::{
     button, column, container, horizontal_space, row, text,
-    text_editor
+    text_editor, Column
 };
 use iced::{
     Theme, Element, Length, Application, Settings, Command,
-    Subscription, Event, Font
+    Subscription, Event, Font, Alignment
 };
-use iced::{executor, event, window};
+use iced::{executor, event, subscription, window};
 use iced_highlighter::Highlighter;
 
 
@@ -22,6 +22,63 @@ fn main() -> iced::Result {
     )
 }
 
+struct Project {
+    toml: &'static [u8],
+    lib_rs: &'static [u8],
+    test_rs: &'static [u8],
+}
+
+impl Project {
+    fn write(&self, path: &Path) {
+        fs::write(path.join("Cargo.toml"), self.toml).unwrap();
+        fs::create_dir(path.join("src")).unwrap();
+        fs::write(path.join("src/lib.rs"), self.lib_rs).unwrap();
+        fs::create_dir(path.join("tests")).unwrap();
+        fs::write(path.join("tests/test.rs"), self.test_rs).unwrap();
+    }
+
+    fn make_new(&self) -> (text_editor::Content, text_editor::Content, text_editor::Content) {
+        let src_code = text_editor::Content::with_text(unsafe { std::str::from_utf8_unchecked(FRESH_ATTRIBUTE.lib_rs) });
+        let test_code = text_editor::Content::with_text(unsafe { std::str::from_utf8_unchecked(FRESH_ATTRIBUTE.test_rs) });
+        let expansion = text_editor::Content::new();
+
+        (src_code, test_code, expansion)
+    }
+
+    fn read(path: &Path) -> (text_editor::Content, text_editor::Content, text_editor::Content) {
+        let src_code = text_editor::Content::with_text(
+            &fs::read_to_string(path.join("src/lib.rs")).unwrap()
+        );
+        let test_code = text_editor::Content::with_text(
+            &fs::read_to_string(path.join("tests/test.rs")).unwrap()
+        );
+        let expansion = text_editor::Content::new();
+
+        (src_code, test_code, expansion)
+    }
+}
+
+const FRESH_ATTRIBUTE: Project = Project {
+    toml: include_bytes!("../assets/attribute/Cargo.toml"),
+    lib_rs: include_bytes!("../assets/attribute/src/lib.rs"),
+    test_rs: include_bytes!("../assets/attribute/tests/test.rs"),
+};
+// const FRESH_DECLARATIVE: Project = Project {
+//     toml: include_bytes!("../assets/declarative/Cargo.toml"),
+//     lib_rs: include_bytes!("../assets/declarative/src/lib.rs"),
+//     test_rs: include_bytes!("../assets/declarative/tests/test.rs"),
+// };
+// const FRESH_DERIVE: Project = Project {
+//     toml: include_bytes!("../assets/derive/Cargo.toml"),
+//     lib_rs: include_bytes!("../assets/derive/src/lib.rs"),
+//     test_rs: include_bytes!("../assets/derive/tests/test.rs"),
+// };
+// const FRESH_FUNCTION: Project = Project {
+//     toml: include_bytes!("../assets/function/Cargo.toml"),
+//     lib_rs: include_bytes!("../assets/function/src/lib.rs"),
+//     test_rs: include_bytes!("../assets/function/tests/test.rs"),
+// };
+
 struct TempDirs {
     attribute: TempDir,
     declarative: TempDir,
@@ -31,16 +88,21 @@ struct TempDirs {
 
 impl TempDirs {
     fn new() -> Self {
-        Self {
-            attribute: TempDir::new().unwrap(),
-            declarative: TempDir::new().unwrap(),
-            derive: TempDir::new().unwrap(),
-            function: TempDir::new().unwrap(),
-        }
+        let slf = Self {
+            attribute: TempDir::with_prefix("mac-attribute").unwrap(),
+            declarative: TempDir::with_prefix("mac-declarative").unwrap(),
+            derive: TempDir::with_prefix("mac-derive").unwrap(),
+            function: TempDir::with_prefix("mac-function").unwrap(),
+        };
+
+        let path = slf.attribute.path();
+        FRESH_ATTRIBUTE.write(path);
+
+        slf
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MacroType {
     Attribute,
     Declarative,
@@ -52,7 +114,7 @@ pub struct Macaroni {
     temp_dirs: Option<TempDirs>,
     src_code: text_editor::Content,
     test_code: text_editor::Content,
-    expansion: String,
+    expansion: text_editor::Content,
     macro_type: Option<MacroType>,
     error: Option<Error>
 }
@@ -60,10 +122,13 @@ pub struct Macaroni {
 #[derive(Clone, Debug)]
 pub enum Message {
     CloseRequested,
+    EditExpansion(text_editor::Action),
     EditSource(text_editor::Action),
     EditTest(text_editor::Action),
     ExpandRequested,
     Expanded(Result<String>),
+    Ignore,
+    Navigate(Option<MacroType>),
     New,
 }
 
@@ -79,11 +144,11 @@ impl Application for Macaroni {
                 temp_dirs: Some(TempDirs::new()),
                 src_code: text_editor::Content::new(),
                 test_code: text_editor::Content::new(),
-                expansion: String::new(),
+                expansion: text_editor::Content::new(),
                 macro_type: None,
                 error: None
             },
-            Command::none()
+            window::maximize(true)
         )
     }
 
@@ -92,13 +157,24 @@ impl Application for Macaroni {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        event::listen_with(|event, _| {
+        let close_req = event::listen_with(|event, _|
             if let Event::Window(window::Event::CloseRequested) = event {
                 Some(Message::CloseRequested)
             } else {
                 None
             }
-        })
+        );
+        let ctrl_c = subscription::run(
+            move || {
+                let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+                let _ = ctrlc::set_handler(move || { let _ = sender.blocking_send(()); });
+                futures::stream::once(async move {
+                    receiver.recv().await;
+                    Message::CloseRequested
+                })
+            }
+        );
+        subscription::Subscription::batch([close_req, ctrl_c])
     }
 
     fn update(&mut self, message: Self::Message) -> Command<Message> {
@@ -107,22 +183,26 @@ impl Application for Macaroni {
                 self.temp_dirs = None;
                 window::close()
             }
+            Message::EditExpansion(action) => {
+                self.expansion.perform(action);
+                Command::none()
+            }
             Message::EditSource(action) => {
                 self.src_code.perform(action);
                 self.error = None;
                 Command::none()
             }
             Message::EditTest(action) => {
-                self.src_code.perform(action);
+                self.test_code.perform(action);
                 self.error = None;
                 Command::none()
             }
             Message::ExpandRequested => {
                 let dir = match self.macro_type {
-                    Some(MacroType::Declarative) => self.temp_dirs.as_ref().unwrap().declarative.path().to_str().unwrap().to_owned(),
-                    Some(MacroType::Attribute) => self.temp_dirs.as_ref().unwrap().attribute.path().to_str().unwrap().to_owned(),
-                    Some(MacroType::Derive) => self.temp_dirs.as_ref().unwrap().derive.path().to_str().unwrap().to_owned(),
-                    Some(MacroType::Function) => self.temp_dirs.as_ref().unwrap().function.path().to_str().unwrap().to_owned(),
+                    Some(MacroType::Declarative) => self.temp_dirs.as_ref().unwrap().declarative.path().to_owned(),
+                    Some(MacroType::Attribute) => self.temp_dirs.as_ref().unwrap().attribute.path().to_owned(),
+                    Some(MacroType::Derive) => self.temp_dirs.as_ref().unwrap().derive.path().to_owned(),
+                    Some(MacroType::Function) => self.temp_dirs.as_ref().unwrap().function.path().to_owned(),
                     None => unreachable!()
                 };
                 Command::perform(
@@ -131,36 +211,97 @@ impl Application for Macaroni {
                 )
             }
             Message::Expanded(Ok(text)) => {
-                self.expansion = text;
+                self.expansion = text_editor::Content::with_text(&text);
                 Command::none()
             }
             Message::Expanded(Err(error)) => {
                 self.error = Some(error);
                 Command::none()
             }
+            Message::Ignore => Command::none(),
+            Message::Navigate(macro_type) => {
+                if macro_type != self.macro_type {
+                    self.macro_type = macro_type;
+                    if let Some(ref macro_type) = self.macro_type {
+                        let dir = match macro_type {
+                            MacroType::Attribute => self.temp_dirs.as_ref().unwrap().attribute.path(),
+                            _ => todo!()
+                        };
+                        (self.src_code, self.test_code, self.expansion) = Project::read(dir);
+                    }
+                }
+                Command::none()
+            }
             Message::New => {
-                // TODO
-                self.src_code = text_editor::Content::new();
-                self.test_code = text_editor::Content::new();
+                match self.macro_type {
+                    Some(MacroType::Attribute) => {
+                        (self.src_code, self.test_code, self.expansion) = FRESH_ATTRIBUTE.make_new();
+                    }
+                    _ => {}
+                }
                 Command::none()
             }
         }
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        let controls = row![
-            button("New").on_press(Message::New),
-            // button("Open").on_press(Message::Open),
-            // button("Save").on_press(Message::Save),
-            // button("Expand").on_press(Message::ExpandRequested)
-        ]
+        let title_bar = row![horizontal_space(Length::Fill), text("Macaroni"), horizontal_space(Length::Fill)].align_items(Alignment::Center);
+        let controls = if self.macro_type.is_some() {
+            row![
+                button("New").on_press(Message::New),
+                horizontal_space(Length::Fill),
+                button("README").on_press(Message::Navigate(None)),
+                button("Attribute").on_press(Message::Navigate(Some(MacroType::Attribute))),
+                button("Declarative").on_press(Message::Navigate(Some(MacroType::Declarative))),
+                button("Derive").on_press(Message::Navigate(Some(MacroType::Derive))),
+                button("Function").on_press(Message::Navigate(Some(MacroType::Function))),
+                horizontal_space(Length::Fill),
+                button("Expand").on_press(Message::ExpandRequested)
+            ]
+        } else {
+            row![
+                horizontal_space(Length::Fill),
+                button("README").on_press(Message::Navigate(None)),
+                button("Attribute").on_press(Message::Navigate(Some(MacroType::Attribute))),
+                button("Declarative").on_press(Message::Navigate(Some(MacroType::Declarative))),
+                button("Derive").on_press(Message::Navigate(Some(MacroType::Derive))),
+                button("Function").on_press(Message::Navigate(Some(MacroType::Function))),
+                horizontal_space(Length::Fill),
+            ]
+        }
         .spacing(10);
-        let src = elements::src_input(self);
-        let test = elements::test_input(self);
-        // let expansion = elements::expansion();
+
+        let src = elements::editor(&self.src_code, Message::EditSource);
+        let test = elements::editor(&self.test_code, Message::EditTest);
+        let ignore_edits = |action| match action {
+            text_editor::Action::Edit(_) => Message::Ignore,
+            action => Message::EditExpansion(action),
+        };
+        let expansion = elements::editor(&self.expansion, ignore_edits);
+
+        let column1 = Column::new()
+            .width(Length::Fill)
+            .spacing(20)
+            .push(src)
+            .push(test);
+        let column2 = Column::new()
+            .width(Length::Fill)
+            .spacing(20)
+            .push(expansion);
+
         let status_bar = elements::status_bar(self);
 
-        container(column![controls, column![src, test].spacing(20), status_bar].spacing(10)).padding(10).into()
+        container(
+            column![
+                title_bar,
+                controls,
+                row![column1, column2].spacing(20),
+                status_bar
+            ]
+            .spacing(10)
+        )
+        .padding(10)
+        .into()
     }
 
     fn theme(&self) -> Theme {
@@ -180,15 +321,16 @@ pub enum Error {
 pub mod actions {
     use super::*;
 
-    pub async fn expand(dir: String, src_code: String, test_code: String) -> Result<String> {
-        tokio::fs::write(format!("{}/src/lib.rs", dir), src_code).await
+    pub async fn expand(dir: PathBuf, src_code: String, test_code: String) -> Result<String> {
+        tokio::fs::write(dir.join("src/lib.rs"), src_code).await
             .map_err(|e| Error::IOFailed(e.kind()))?;
-        tokio::fs::write(format!("{}/tests/test.rs", dir), test_code).await
+        tokio::fs::write(dir.join("tests/test.rs"), test_code).await
             .map_err(|e| Error::IOFailed(e.kind()))?;
         match tokio::process::Command::new("cargo")
             .current_dir(dir)
             .arg("expand")
-            .arg("tests/test.rs")
+            .arg("--test")
+            .arg("test")
             .output().await
         {
             Ok(output) => {
@@ -203,36 +345,6 @@ pub mod actions {
             }
         }
     }
-    // async fn pick_file() -> Result<(PathBuf, Arc<String>), Error> {
-    //     let handle = rfd::AsyncFileDialog::new()
-    //         .set_title("Choose a text file...")
-    //         .pick_file().await
-    //         .ok_or(Error::DialogClosed)?;
-    //     load_file(handle.path().to_owned()).await
-    // }
-
-    // async fn load_file(path: PathBuf) -> Result<(PathBuf, Arc<String>), Error> {
-    //     tokio::fs::read_to_string(&path).await
-    //         .map(|x| (path, Arc::new(x)))
-    //         .map_err(|error| Error::IOFailed(error.kind()))
-    // }
-
-    // async fn save_file(path: Option<PathBuf>, text: String) -> Result<PathBuf, Error> {
-    //     let path = if let Some(path) = path {
-    //         path
-    //     } else {
-    //         rfd::AsyncFileDialog::new()
-    //             .set_title("Choose a file name...")
-    //             .save_file().await
-    //             .ok_or(Error::DialogClosed)
-    //             .map(|handle| handle.path().to_owned())?
-    //     };
-
-    //     tokio::fs::write(&path, text).await
-    //         .map_err(|error| Error::IOFailed(error.kind()))?;
-
-    //     Ok(path)
-    // }
 }
 
 pub mod elements {
@@ -243,29 +355,16 @@ pub mod elements {
         } else {
             match slf.macro_type {
                 Some(ref t) => text(format!("{:?}", t)),
-                None => text(String::new())
+                None => text("Home")
             }
         };
         row![status, horizontal_space(Length::Fill)].into()
     }
 
-    pub fn src_input<'a>(slf: &'a Macaroni) -> Element<'a, Message> {
-        text_editor(&slf.src_code)
-        .on_action(Message::EditSource)
-        .highlight::<Highlighter>(
-            iced_highlighter::Settings {
-                theme: iced_highlighter::Theme::SolarizedDark,
-                extension: "rs".to_string()
-            },
-            |highlight, _theme| { highlight.to_format() }
-        )
-        .into()
-    }
-
-    pub fn test_input<'a>(slf: &'a Macaroni) -> Element<'a, Message> {
-        text_editor(&slf.test_code)
-        .on_action(Message::EditTest)
-        .highlight::<Highlighter>(
+    pub fn editor<'a>(content: &'a text_editor::Content, on_action: impl Fn(text_editor::Action) -> Message + 'static) -> Element<'a, Message> {
+        text_editor(content)
+            .on_action(on_action)
+            .highlight::<Highlighter>(
             iced_highlighter::Settings {
                 theme: iced_highlighter::Theme::SolarizedDark,
                 extension: "rs".to_string()
@@ -275,18 +374,3 @@ pub mod elements {
         .into()
     }
 }
-
-// fn action<'a>(
-//     content: Element<'a, Message>,
-//     label: &str,
-//     on_press: Message,
-// ) -> Element<'a, Message> {
-//     tooltip(
-//         button(container(content).width(3).center_x()) .on_press(on_press),
-//         label,
-//         tooltip::Position::FollowCursor
-//     )
-//     .padding(10)
-//     .style(theme::Container::Box)
-//     .into()
-// }
