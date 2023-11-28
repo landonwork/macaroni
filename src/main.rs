@@ -1,9 +1,11 @@
+#![cfg_attr(not(debug), windows_subsystem = "windows")]
+
 use std::{io, fs, path::{Path, PathBuf}};
 use tempfile::TempDir;
 
 use iced::widget::{
     button, column, container, horizontal_space, row, text,
-    text_editor, Column, pick_list
+    text_editor, Column, pick_list, scrollable
 };
 use iced::{
     Theme, Element, Length, Application, Settings, Command,
@@ -121,6 +123,7 @@ pub struct Macaroni {
     macro_type: Option<MacroType>,
     temp_dirs: Option<TempDirs>,
     theme: highlighter::Theme,
+    thinking: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +156,7 @@ impl Application for Macaroni {
                 macro_type: None,
                 temp_dirs: Some(TempDirs::new()),
                 theme: highlighter::Theme::SolarizedDark,
+                thinking: false,
             },
             window::maximize(true)
         )
@@ -204,6 +208,7 @@ impl Application for Macaroni {
                 Command::none()
             }
             Message::ExpandRequested => {
+                self.thinking = true;
                 let dir = match self.macro_type {
                     Some(MacroType::Declarative) => self.temp_dirs.as_ref().unwrap().declarative.path().to_owned(),
                     Some(MacroType::Attribute) => self.temp_dirs.as_ref().unwrap().attribute.path().to_owned(),
@@ -217,10 +222,12 @@ impl Application for Macaroni {
                 )
             }
             Message::Expanded(Ok(text)) => {
+                self.thinking = false;
                 self.expansion = text_editor::Content::with_text(&text);
                 Command::none()
             }
             Message::Expanded(Err(error)) => {
+                self.thinking = false;
                 self.error = Some(error);
                 Command::none()
             }
@@ -231,6 +238,7 @@ impl Application for Macaroni {
                     if let Some(ref macro_type) = self.macro_type {
                         let dir = match macro_type {
                             MacroType::Attribute => self.temp_dirs.as_ref().unwrap().attribute.path(),
+                            MacroType::Declarative => self.temp_dirs.as_ref().unwrap().declarative.path(),
                             _ => todo!()
                         };
                         (self.src_code, self.test_code, self.expansion) = Project::read(dir);
@@ -258,10 +266,17 @@ impl Application for Macaroni {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        let title_bar = row![horizontal_space(Length::Fill), text("Macaroni"), horizontal_space(Length::Fill)].align_items(Alignment::Center);
-        let controls = if self.macro_type.is_some() {
-            row![
-                button("New").on_press(Message::New),
+        let title_bar = row![
+            horizontal_space(Length::Fill),
+            text("Macaroni"),
+            horizontal_space(Length::Fill)
+        ];
+        let pickers = row![
+            horizontal_space(Length::Fill),
+            pick_list(highlighter::Theme::ALL, Some(self.theme), Message::ThemeSelected),
+        ];
+
+        let tabs = container(row![
                 horizontal_space(Length::Fill),
                 button("Home").on_press(Message::Navigate(None)),
                 button("Attribute").on_press(Message::Navigate(Some(MacroType::Attribute))),
@@ -269,19 +284,26 @@ impl Application for Macaroni {
                 button("Derive").on_press(Message::Navigate(Some(MacroType::Derive))),
                 button("Function").on_press(Message::Navigate(Some(MacroType::Function))),
                 horizontal_space(Length::Fill),
+            ]
+            .spacing(10)
+            .width(Length::Fixed(600.0))
+        );
+
+        let controls = if self.macro_type.is_some() {
+            row![
+                horizontal_space(Length::Fill),
+                button("New").on_press(Message::New),
+                tabs,
                 button("Expand").on_press(Message::ExpandRequested),
-                pick_list(highlighter::Theme::ALL, Some(self.theme), Message::ThemeSelected),
+                horizontal_space(Length::Fill),
             ]
         } else {
             row![
                 horizontal_space(Length::Fill),
-                button("Home").on_press(Message::Navigate(None)),
-                button("Attribute").on_press(Message::Navigate(Some(MacroType::Attribute))),
-                button("Declarative").on_press(Message::Navigate(Some(MacroType::Declarative))),
-                button("Derive").on_press(Message::Navigate(Some(MacroType::Derive))),
-                button("Function").on_press(Message::Navigate(Some(MacroType::Function))),
+                tabs,
                 horizontal_space(Length::Fill),
             ]
+            .width(Length::Fill)
         }
         .spacing(10);
 
@@ -299,13 +321,18 @@ impl Application for Macaroni {
                 .spacing(20)
                 .push(src)
                 .push(test);
-            let column2 = Column::new()
+            let mut column2 = Column::new()
                 .width(Length::Fill)
                 .spacing(20)
                 .push(expansion);
+            if self.thinking {
+                column2 = column2.push(text("Expanding..."));
+            }
             row![column1, column2].spacing(20)
         } else {
-            row![text(README_TEXT)].align_items(Alignment::Center)
+            row![scrollable(text(README_TEXT)).width(Length::Fill)]
+                .align_items(Alignment::Center)
+                .width(Length::Fill)
         };
 
         let status_bar = elements::status_bar(self);
@@ -313,6 +340,7 @@ impl Application for Macaroni {
         container(
             column![
                 title_bar,
+                pickers,
                 controls,
                 body,
                 status_bar
@@ -324,7 +352,7 @@ impl Application for Macaroni {
     }
 
     fn theme(&self) -> Theme {
-        Theme::Dark
+        Theme::Light
     }
 }
 
