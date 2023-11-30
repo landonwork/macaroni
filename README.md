@@ -28,6 +28,7 @@ compile and expand the macros as I am working on them.
 - [x] Write a function-like macro, compile, and expand it
 - [x] Remove extra line breaks caused by Windows
 - [x] Keep the tab buttons centered
+- [ ] Put line and space below header
 - [ ] Insert spaces when tab is pressed
 - [ ] Create a custom Macaroni theme
 - [ ] Make app theme switcher
